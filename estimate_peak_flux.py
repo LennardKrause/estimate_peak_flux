@@ -72,8 +72,28 @@ def read_sfrm(fname):
         # assign values from 32 bit overflow table
         data[data == 65535] = table_32
         return header, data
-
-def find_peaks(frames, queue, thresh):
+        
+def read_Pilatus(fname, dim1=981, dim2=1043, offset=4096, bytecode=np.int32):
+    # translate bytecode into bytes per pixel
+    bpp = len(np.array(0, bytecode).tostring())
+    # determine the image size
+    imsize = dim2 * dim1 * bpp
+    with open(fname, 'rb') as f:
+        # read the header
+        h = f.read(offset)
+        # read the image
+        stream = f.read(imsize)
+    h = h[h.index(b'# '):]
+    h = h[:h.index(b'\x00')]
+    header = str(h)
+    # reshape the image into 2d array (dim2, dim1)
+    # dtype = bytecode
+    reshaped = np.fromstring(stream, bytecode).reshape((dim2, dim1))
+    # orient as in Albula
+    data = np.flipud(reshaped)
+    return header, data
+    
+def find_peaks(frames, read_funct, queue, thresh):
     # first iteration, find maxima and append to list
     # read the data, store relevant frame data in list
     local_max = []
@@ -82,7 +102,7 @@ def find_peaks(frames, queue, thresh):
     logging.info('\n >>> Hunting Peaks')
     for idx, fname in enumerate(frames):
         # read the data
-        _, f = read_sfrm(fname)
+        _, f = read_funct(fname)
         bname = os.path.basename(fname)
         # tell me where you are
         print(bname, end='\r')
@@ -153,12 +173,13 @@ def get_frame_info(fnam):
         fnum = int(_split.pop())
         rnum = int(_split.pop())
         stem = '_'.join(_split)
-        return stem, rnum, fnum
+        return stem, rnum, fnum, ext
     except (ValueError, IndexError):
-        return None, None
+        print('ERROR! Can\'t handle frame name: {}'.format(fnam))
+        return '_'.join(_split), None, None, ext
     
 def main():
-            
+    
     def I_gauss(x,I,mu,sig):
         return I*(1/2.*(1+erf(((x+dx/2.)-mu)/(sig*np.sqrt(2)))) - 1/2.*(1+erf(((x-dx/2.)-mu)/(sig*np.sqrt(2)))))
     
@@ -174,8 +195,10 @@ def main():
     def f_lorentz(t,I,mu,gamma):
         return I*1/np.pi*(gamma/v)/((t-mu/v)**2+(gamma/v)**2)
     
+    # parse arguments
     _ARGS = init_argparser()
     
+    # Plotting parameters
     mpl.rcParams['figure.figsize'] = [12.60, 7.68]
     mpl.rcParams['savefig.dpi'] = 100
     mpl.rcParams['legend.fontsize'] = 12
@@ -188,7 +211,7 @@ def main():
     if len(frames) == 0:
         print('ERROR: Not enough frames!')
         raise SystemExit
-    stem, _, _ = get_frame_info(os.path.basename(frames[0]))
+    stem, _, _, ext = get_frame_info(os.path.basename(frames[0]))
     
     # setup the logger and the out file
     level    = logging.INFO
@@ -197,12 +220,14 @@ def main():
     logging.basicConfig(level = level, format = format, handlers = handlers)
     out_name = 'Peakhunt_{}.csv'.format(stem)
     
+    # reading .raw files
     logging.info('> reading .raw files')
     raw_data = []
-    if _ARGS._RAW is not None:
+    if _ARGS._RAW is not None and ext == '.sfrm':
         for raw in glob.glob(_ARGS._RAW):
             raw_data.append(np.rint(np.genfromtxt(raw, usecols=(0,1,2,3,13,14,15), delimiter=[4,4,4,8,8,4,8,8,8,8,8,8,3,7,7,8,7,7,8,6,5,7,7,7,2,5,9,7,7,4,6,11,3,6,8,8,8,8,4])).astype(int))
     
+    # checking directories
     logging.info('> checking directories')
     if _ARGS._OUTPATH is None:
         out_path = os.getcwd()
@@ -211,22 +236,37 @@ def main():
         if not os.path.exists(out_path):
             os.makedirs(out_path)
     
+    # specify frame read function
+    if ext == '.sfrm':
+        read_funct = read_sfrm
+    elif ext == '.tif':
+        read_funct = read_Pilatus
+    else:
+        logging.info('ERROR! Unknown file format: {}'.format(ext))
+    
     logging.info('> gathering frame information')
     # calculate some frame specific
     # constants once in the beginning
-    temp_header, temp_data = read_sfrm(frames[0])
+    temp_header, temp_data = read_funct(frames[0])
     # read the first frame
     # get image dimensions
     rows, cols = temp_data.shape
     # calculate reduced image dimension (scale of 512x512)
     # to find coordinates in the .raw files
     red_dim = max(temp_data.shape) / 512
-    #'CUMULAT': Accumulated exposure time in real hours
-    #'ELAPSDR': Requested time for this frame in seconds
-    #'ELAPSDA': Actual time for this frame in seconds
-    fexp = float(re.findall('\s*ELAPSDA\s*:\s*(\d+\.\d+)', temp_header)[0])
-    # Magnitude of scan range in decimal degrees
-    fwth = float(re.findall('\s*RANGE\s*:\s*(\d+\.\d+)', temp_header)[0])
+    if ext == '.sfrm':
+        #'CUMULAT': Accumulated exposure time in real hours
+        #'ELAPSDR': Requested time for this frame in seconds
+        #'ELAPSDA': Actual time for this frame in seconds
+        fexp = float(re.findall('\s*ELAPSDA\s*:\s*(\d+\.\d+)', temp_header)[0])
+        # Magnitude of scan range in decimal degrees
+        fwth = float(re.findall('\s*RANGE\s*:\s*(\d+\.\d+)', temp_header)[0])
+    elif ext == '.tif':
+        fexp = float(re.findall('#\s+Exposure_period\s+(\d+\.\d+)\s+s', temp_header)[0])
+        # Magnitude of scan range in decimal degrees
+        with open(''.join([os.path.splitext(frames[0])[0], '.inf'])) as inf:
+            #SCAN_ROTATION=0.0 0.5 0.5
+            fwth = float(re.findall('\s*SCAN_ROTATION\s*=\s*\d+\.\d+\s+\d+\.\d+\s+(\d+\.\d+)', inf.read())[0])
     # full queue size
     q = 2 * _ARGS._QUEUE + 1
     # grid stepsize
@@ -242,7 +282,7 @@ def main():
     logging.info(' - exposure : {:6.2f}s\n - scanwidth: {:6.2f}deg'.format(fexp, fwth))
     
     # find maxima
-    frame_data, local_max = find_peaks(frames, _ARGS._QUEUE, _ARGS._MININT)
+    frame_data, local_max = find_peaks(frames, read_funct, _ARGS._QUEUE, _ARGS._MININT)
     if len(local_max) == 0:
         logging.info('ERROR: Not enough data!')
         raise SystemExit
@@ -343,7 +383,7 @@ def main():
                 raw_int = []
                 fnam = os.path.basename(frames[idx])
                 for raw in raw_data:
-                    _, rnum, fnum = get_frame_info(fnam)
+                    _, rnum, fnum, _ = get_frame_info(fnam)
                     x = np.asarray([bruker_px, bruker_py, fnum]).astype(int)
                     vals = raw[(raw[:,4:] >= x-1).all(1) & (raw[:,4:] <= x+1).all(1)]
                     h,k,l = 0,0,0
@@ -398,7 +438,7 @@ def main():
                 plt.close()
     
     cryst_mosaic = np.asarray(cryst_mosaic)
-    logging.info('\nEst. mosaicity: {:.2f} ({:.2f} - {:.2f})'.format(np.mean(cryst_mosaic), np.min(cryst_mosaic), np.max(cryst_mosaic)))
+    logging.info('\nEst. mosaicity: {:.2f}° ({:.2f} - {:.2f})'.format(np.mean(cryst_mosaic), np.min(cryst_mosaic), np.max(cryst_mosaic)))
 
 if __name__ == '__main__':
     main()
