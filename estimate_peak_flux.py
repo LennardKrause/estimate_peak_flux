@@ -165,6 +165,9 @@ def main():
     def f_gauss(t,I,mu,sig):
         return I*(1/((sig/v)*np.sqrt(2*np.pi))*np.exp(-1/2.*(t-mu/v)**2/(sig/v)**2))
     
+    def f_gauss_ang(t,I,mu,sig):
+        return I*(1/((sig)*np.sqrt(2*np.pi))*np.exp(-1/2.*(t-mu)**2/(sig)**2))
+    
     def I_lorentz(x,I,mu,gamma):
         return I*(1/np.pi*np.arctan2((x+dx/2.)-mu,gamma) + 1/2. - (1/np.pi*np.arctan2((x-dx/2.)-mu,gamma) + 1/2.))
         
@@ -250,6 +253,7 @@ def main():
         logging.info('ERROR: Not enough peaks!')
         raise SystemExit
     
+    cryst_mosaic = []
     with open(os.path.join(out_path, out_name), 'w') as wfile, PdfPages(os.path.join(out_path, '{}-fit.pdf'.format(stem))) as pdf:
         wfile.write('Gauss;Sum;{};HKL;Frame;Profile\n'.format(';'.join(['Iraw_{:02}'.format(i) for i,v in enumerate(raw_data)])))
         for (name, idx, px, py, peak) in filtered:
@@ -274,6 +278,13 @@ def main():
             # peak profile data
             prof_data = np.asarray(prof_list)
             
+            # Mosaicity
+            I0 = np.sum(prof_data)
+            p0 = [I0, 0, 0.2]
+            m_popt, m_pcov = curve_fit(f_gauss_ang, xgrid_f, prof_data, p0=p0)
+            mosaic = float(m_popt[2])
+            cryst_mosaic.append(mosaic)
+            
             # FIT PEAKS GAUSS/LORENTZ
             # initial guesses
             # sigma or gamma (gauss / lorentz)
@@ -285,6 +296,7 @@ def main():
             logging.info('|\n| >>> Gaussian Fitted Peak')
             logging.info('|  Integrated pixel intensity (sum) [phts]: {:.2e}'.format(I0))
             logging.info('|  Integrated pixel intensity (fit) [phts]: {:.2e}'.format(g_popt[0]))
+            logging.info('|  Mosaicity (fit) [deg]: {:.2f}'.format(mosaic))
             logging.info('|  FWHM of count rate function [sec]: {:.2f}'.format(g_popt[2]*2.355))
             logging.info('|  Maximum count rate [phts/s]: {:.2e}'.format(g_max))
             
@@ -368,9 +380,9 @@ def main():
                 p11.ticklabel_format(style='sci', axis='y', scilimits=(0,0))
                 p12.ticklabel_format(style='sci', axis='y', scilimits=(0,0))
                 data = p11.plot(xgrid_f, prof_data, 'k*', label='Data')
-                gf = p11.plot(xgrid_f, I_gauss(xgrid_f,*g_popt), '-', color='#37a0cb', label='G: {:.2e}'.format(g_popt[0]))
+                gf = p11.plot(xgrid_f, I_gauss(xgrid_f, *g_popt), '-', color='#37a0cb', label='G: {:.2e}'.format(g_popt[0]))
                 gs = p12.plot(xgrid_s, f_gauss(xgrid_s, *g_popt), '-', color='#37a0cb', label='G: {:.2e}'.format(g_max))
-                fig.suptitle('Integrated pixel intensity (sum) [phts]: {:.2e}'.format(I0))
+                fig.suptitle('Integrated pixel intensity (sum) [phts]: {:.2e}\nMosaicity (fit) [deg]: {:.2f}'.format(I0, mosaic))
                 plt.annotate('G:Gaussian fit, T:Gaussian fit tails only, L:Lorentzian fit', xy=(0.5, 0.02), xycoords='figure fraction', ha='center')
                 if _ARGS._RAW is not None:
                     plt.annotate('raw [ctns]: {}'.format(raw_int_s), xy=(0.5, 0.92), xycoords='figure fraction', ha='center')
@@ -384,6 +396,9 @@ def main():
                 p12.legend()
                 pdf.savefig()
                 plt.close()
+    
+    cryst_mosaic = np.asarray(cryst_mosaic)
+    logging.info('\nEst. mosaicity: {:.2f} ({:.2f} - {:.2f})'.format(np.mean(cryst_mosaic), np.min(cryst_mosaic), np.max(cryst_mosaic)))
 
 if __name__ == '__main__':
     main()
