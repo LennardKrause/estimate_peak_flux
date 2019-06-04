@@ -55,8 +55,8 @@ def read_sfrm(fname):
         im_size = nrows * ncols * npixb
         # bytes-per-pixel to datatype
         bpp2dt = [None, np.uint8, np.uint16, None, np.uint32]
-        # reshape data, set datatype to np.uint32
-        data = np.fromstring(f.read(im_size), bpp2dt[npixb]).reshape((nrows, ncols)).astype(np.uint32)
+        # set datatype to np.uint32
+        data = np.fromstring(f.read(im_size), bpp2dt[npixb]).astype(np.uint32)
         # read the 16 bit overflow table
         # table is padded to a multiple of 16 bytes
         read_16 = int(np.ceil(nov16 * 2 / 16)) * 16
@@ -71,7 +71,7 @@ def read_sfrm(fname):
         data[data == 255] = table_16
         # assign values from 32 bit overflow table
         data[data == 65535] = table_32
-        return header, data
+        return header, data.reshape((nrows, ncols))
         
 def read_Pilatus(fname, dim1=981, dim2=1043, offset=4096, bytecode=np.int32):
     # translate bytecode into bytes per pixel
@@ -84,8 +84,7 @@ def read_Pilatus(fname, dim1=981, dim2=1043, offset=4096, bytecode=np.int32):
         # read the image
         stream = f.read(imsize)
     h = h[h.index(b'# '):]
-    h = h[:h.index(b'\x00')]
-    header = str(h)
+    header = h[:h.index(b'\x00')].decode()
     # reshape the image into 2d array (dim2, dim1)
     # dtype = bytecode
     reshaped = np.fromstring(stream, bytecode).reshape((dim2, dim1))
@@ -109,7 +108,12 @@ def find_peaks(frames, read_funct, queue, thresh):
         # save the data
         frame_data.append(f)
         # find position where data larger threshold
-        pos = np.transpose(np.where(f >= thresh))
+        #
+        # numpy is substantially faster on vectors than arrays!
+        # this:    pos = np.argwhere(f >= thresh)
+        # same as: pos = np.transpose((f >= thresh).nonzero())
+        # is 4 times slower than:
+        pos = np.transpose(np.unravel_index((f.ravel() >= thresh).nonzero()[0], f.shape))
         # skip peaks whose tails are outside the frame list
         i_min = idx - queue
         i_max = idx + queue +1
@@ -175,7 +179,7 @@ def get_frame_info(fnam):
         stem = '_'.join(_split)
         return stem, rnum, fnum, ext
     except (ValueError, IndexError):
-        print('ERROR! Can\'t handle frame name: {}'.format(fnam))
+        #print('ERROR! Can\'t handle frame name: {}'.format(fnam))
         return '_'.join(_split), None, None, ext
     
 def main():
@@ -223,9 +227,12 @@ def main():
     # reading .raw files
     logging.info('> reading .raw files')
     raw_data = []
-    if _ARGS._RAW is not None and ext == '.sfrm':
-        for raw in glob.glob(_ARGS._RAW):
-            raw_data.append(np.rint(np.genfromtxt(raw, usecols=(0,1,2,3,13,14,15), delimiter=[4,4,4,8,8,4,8,8,8,8,8,8,3,7,7,8,7,7,8,6,5,7,7,7,2,5,9,7,7,4,6,11,3,6,8,8,8,8,4])).astype(int))
+    if _ARGS._RAW is not None:
+        if ext == '.sfrm':
+            for raw in glob.glob(_ARGS._RAW):
+                raw_data.append(np.rint(np.genfromtxt(raw, usecols=(0,1,2,3,13,14,15), delimiter=[4,4,4,8,8,4,8,8,8,8,8,8,3,7,7,8,7,7,8,6,5,7,7,7,2,5,9,7,7,4,6,11,3,6,8,8,8,8,4])).astype(int))
+        else:
+            logging.info(' - .raw file peak search is currently limited to .sfrm frames!')
     
     # checking directories
     logging.info('> checking directories')
@@ -279,7 +286,7 @@ def main():
     xgrid_s = np.linspace(xgrid_f[0]/v, xgrid_f[-1]/v, len(xgrid_f)*10)
     # stepsize, obsolete but used by the fitting functions
     dx = fwth
-    logging.info(' - exposure : {:6.2f}s\n - scanwidth: {:6.2f}deg'.format(fexp, fwth))
+    logging.info(' - exposure : {:6.2f} s\n - scanwidth: {:6.2f} deg'.format(fexp, fwth))
     
     # find maxima
     frame_data, local_max = find_peaks(frames, read_funct, _ARGS._QUEUE, _ARGS._MININT)
