@@ -1,7 +1,8 @@
 import numpy as np
-import glob, argparse, os, re, sys
+import glob, argparse, os, re, sys, gc
+from collections import defaultdict
 import matplotlib as mpl
-mpl.use('Qt5Agg')
+mpl.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from scipy.optimize import curve_fit
@@ -15,10 +16,12 @@ def init_argparser():
     parser.add_argument('-o', required=False, default=None, metavar='path', type=str, dest='_OUTPATH', help='Specify the output path')
     parser.add_argument('-q', required=False, default=3,    metavar='int', type=int, dest='_QUEUE', help='Image queue, 2N+1 frames to monitor a profile, default: 3')
     parser.add_argument('-i', required=False, default=1e5,  metavar='int', type=int, dest='_MININT', help='Set the minimum peak intensity threshold for the peak search, default: 100000')
-    parser.add_argument('-m', required=False, action='store_true',  dest='_USEMAT', help='Track peaks by using the maximum value in a 3x3 matrix around the peak position instead of the exact coordinates')
+    parser.add_argument('-m', required=False, default=1,    metavar='int', type=int, dest='_MSIZE', help='Track peaks by using the maximum value in a NxN matrix (with N = 2x+1) around the peak position')
+    #parser.add_argument('-m', required=False, action='store_true',  dest='_USEMAT', help='Track peaks by using the maximum value in a 3x3 matrix around the peak position instead of the exact coordinates')
     parser.add_argument('-t', required=False, action='store_true',  dest='_TAILS', help='Fit Gaussian to tails (additionally)')
     parser.add_argument('-l', required=False, action='store_true',  dest='_LORENTZ', help='Fit Lorentzian (additionally)')
     parser.add_argument('-p', required=False, action='store_false', dest='_PLOT', help='Store plots of the fitted peaks in *.pdf (*framename-stem)')
+    parser.add_argument('-d', required=False, action='store_true',  dest='_TIMEIT', help='DEBUG, time the script only')
     # print help if script is run without arguments
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
@@ -56,7 +59,7 @@ def read_sfrm(fname):
         # bytes-per-pixel to datatype
         bpp2dt = [None, np.uint8, np.uint16, None, np.uint32]
         # set datatype to np.uint32
-        data = np.fromstring(f.read(im_size), bpp2dt[npixb]).astype(np.uint32)
+        data = np.frombuffer(f.read(im_size), bpp2dt[npixb]).astype(np.uint32)
         # read the 16 bit overflow table
         # table is padded to a multiple of 16 bytes
         read_16 = int(np.ceil(nov16 * 2 / 16)) * 16
@@ -73,26 +76,100 @@ def read_sfrm(fname):
         data[data == 65535] = table_32
         return header, data.reshape((nrows, ncols))
         
+def read_Pilatus_X(fname):
+    with open(fname, 'rb') as b:
+        b.seek(4096)
+        data = np.flipud(np.ndarray(shape=(1043, 981), dtype=np.int32, buffer=b.read(4092732)))
+    return None, data
+
 def read_Pilatus(fname, dim1=981, dim2=1043, offset=4096, bytecode=np.int32):
     # translate bytecode into bytes per pixel
     bpp = len(np.array(0, bytecode).tostring())
     # determine the image size
     imsize = dim2 * dim1 * bpp
-    with open(fname, 'rb') as f:
+    with open(fname, 'rb') as b:
         # read the header
-        h = f.read(offset)
+        h = b.read(offset)
         # read the image
-        stream = f.read(imsize)
+        d = np.ndarray(shape=(dim2, dim1), dtype=np.int32, buffer=b.read(imsize))
     h = h[h.index(b'# '):]
     header = h[:h.index(b'\x00')].decode()
-    # reshape the image into 2d array (dim2, dim1)
-    # dtype = bytecode
-    reshaped = np.fromstring(stream, bytecode).reshape((dim2, dim1))
     # orient as in Albula
-    data = np.flipud(reshaped)
+    data = np.flipud(d)
     return header, data
     
-def find_peaks(frames, read_funct, queue, thresh):
+def find_peaks(frames, read_funct, queue, thresh, msize=1):
+    logging.info('\n >>> Hunting Peaks')
+    # first iteration, find maxima and append to list
+    # read the data, store relevant frame data in list
+    local_max = []
+    # list temporarily storing the images
+    frame_data = []
+    # dictionary storing 3x3 matrix (default, adjusted by msize parameter!)
+    # centered around all found peaks (> thresh)
+    # format:
+    # peak_data[index in frames][(peak x, peak y)][data: 3x3 matrix]
+    peak_data = defaultdict(dict)
+    for idx, fname in enumerate(frames):
+        # read the data
+        _, data = read_funct(fname)
+        bname = os.path.basename(fname)
+        # tell me where you are
+        print(bname, end='\r')
+        # save the data to be accessible for peaks found on upcoming images
+        frame_data.append(data)
+        # find xy where the data is larger than the given threshold (thresh)
+        #
+        # numpy is substantially faster on vectors than arrays!
+        # this:    pos = np.argwhere(data >= thresh)
+        # same as: pos = np.transpose((data >= thresh).nonzero())
+        # is 4 times slower than:
+        pos = np.transpose(np.unravel_index((data.ravel() >= thresh).nonzero()[0], data.shape))
+        idx_min = idx - queue
+        idx_max = idx + queue +1
+        idx_rng = range(idx_min, idx_max)
+        # skip peaks whose tails are outside the frame list
+        # did we find something?
+        if len(pos) > 0 and idx_max <= len(frames) and idx_min >= 0:
+            # iterate over all found peaks and add the frame indices of the full
+            # peak range (queue size) to dictionary peak_data
+            # save the framename, frame index in frames, intensity and position
+            for p in pos:
+                px, py = p
+                ixy = data[px,py].copy()
+                logging.info('{} > {:7} @ {:>4}x{:<4}'.format(bname, ixy, px, py))
+                local_max.append((bname, idx, px, py, ixy))
+                # iterate over the full peak range
+                for i in idx_rng:
+                    peak_data[i][(px,py)] = None
+        # store only 3x3 peak centered matrix instead of the whole image
+        # delete the images (frame_data[idx]) that are out of queue size range
+        # of peaks, the cleanup of frame_data drags behind the current idx by
+        # idx - queue
+        if idx_min >= 0:
+            if idx_min in peak_data:
+                for (px,py) in peak_data[idx_min]:
+                    # .copy() stores only the 3x3 matrix instead of a reference 
+                    # to the image and makes sure that the image is no longer
+                    # stored in memory after we de-reference with:
+                    # frame_data[idx_min] = None
+                    peak_data[idx_min][(px,py)] = frame_data[idx_min][px-msize:px+1+msize, py-msize:py+1+msize].copy()
+            # de-reference the large image array to save memory
+            frame_data[idx_min] = None
+    # check if the remaining frames are contributing to peak ranges
+    # this is necessary because we break the peak search as soon as idx_max
+    # exceeds the number of frames
+    # uncommented as it's a copy of the code already used above 
+    while idx_min < len(frames) -1:
+        idx_min += 1
+        if idx_min in peak_data:
+            for (px,py) in peak_data[idx_min]:
+                peak_data[idx_min][(px,py)] = frame_data[idx_min][px-msize:px+1+msize, py-msize:py+1+msize].copy()
+        frame_data[idx_min] = None
+    print()
+    return peak_data, local_max
+    
+def find_peaks_SAVE(frames, read_funct, queue, thresh):
     # first iteration, find maxima and append to list
     # read the data, store relevant frame data in list
     local_max = []
@@ -125,9 +202,9 @@ def find_peaks(frames, read_funct, queue, thresh):
             # save the peak position
             for p in pos:
                 px, py = p
-                peak = f[px,py]
-                logging.info('{} > {:7} @ {:>4}x{:<4}'.format(bname, peak, px, py))
-                local_max.append((bname, idx, px, py, peak))
+                ixy = f[px,py]
+                logging.info('{} > {:7} @ {:>4}x{:<4}'.format(bname, ixy, px, py))
+                local_max.append((bname, idx, px, py, ixy))
         # forget unnecessarily stored data
         idx_del = i_min
         if idx_del >= 0 and idx_del not in ind_to_store:
@@ -135,7 +212,7 @@ def find_peaks(frames, read_funct, queue, thresh):
     print()
     return frame_data, local_max
 
-def filter_peaks(local_max, queue):
+def filter_peaks(local_max, queue, msize):
     logging.info('\n >>> Filtering Peaklist: {}'.format(len(local_max)))
     # filter local_max for overlapping spots
     # lx,ly,li,lm: last x, y, intensity, multiplicity
@@ -144,27 +221,27 @@ def filter_peaks(local_max, queue):
     reject = []
     local_max.sort(key = lambda v: v[2])
     for id in local_max:
-        (bname, idx, px, py, peak) = id
+        (bname, idx, px, py, ixy) = id
         # track spot position in 3x3 matrix
         prefix = ' '
-        if px in range(lx-1, lx+2) and py in range(ly-1, ly+2):
+        if px in range(lx-msize, lx+msize+1) and py in range(ly-msize, ly+msize+1):
             lm += 1
-            if peak > li:
+            if ixy > li:
                 prefix = '+'
                 filtered.pop()
                 reject.pop()
             else:
-                logging.info('-{}:{:7} @ {:>4}x{:<4}/{:3}'.format(bname, peak, px, py, lm))
+                logging.info('-{}:{:7} @ {:>4}x{:<4}/{:3}'.format(bname, ixy, px, py, lm))
                 continue
         else:
             lm = 1
         reject.append(lm)
         filtered.append(id)
-        lx, ly, li = px, py, peak
-        logging.info('{}{}:{:7} @ {:>4}x{:<4}/{:3}'.format(prefix, bname, peak, px, py, lm))
+        lx, ly, li = px, py, ixy
+        logging.info('{}{}:{:7} @ {:>4}x{:<4}/{:3}'.format(prefix, bname, ixy, px, py, lm))
     filtered = [n for i,n in enumerate(filtered) if reject[i] < queue]
     logging.info('\n >>> Filtered Peaklist: {}'.format(len(filtered)))
-    [logging.info('{}{:5}{:7} @ {:>4}x{:<4}'.format(bname, idx, peak, px, py)) for (bname, idx, px, py, peak) in filtered]
+    [logging.info('{}{:5}{:7} @ {:>4}x{:<4}'.format(bname, idx, ixy, px, py)) for (bname, idx, px, py, ixy) in filtered]
     return filtered
 
 def get_frame_info(fnam):
@@ -205,9 +282,9 @@ def main():
     # Plotting parameters
     mpl.rcParams['figure.figsize'] = [12.60, 7.68]
     mpl.rcParams['savefig.dpi'] = 100
-    mpl.rcParams['legend.fontsize'] = 12
+    mpl.rcParams['legend.fontsize'] = 10
     mpl.rcParams['figure.titlesize'] = 12
-    mpl.rcParams['font.size'] = 12
+    mpl.rcParams['font.size'] = 10
     
     # find the frames
     print('> collecting frames')
@@ -246,15 +323,16 @@ def main():
     # specify frame read function
     if ext == '.sfrm':
         read_funct = read_sfrm
+        temp_header, temp_data = read_sfrm(frames[0])
     elif ext == '.tif':
-        read_funct = read_Pilatus
+        read_funct = read_Pilatus_X
+        temp_header, temp_data = read_Pilatus(frames[0])
     else:
         logging.info('ERROR! Unknown file format: {}'.format(ext))
     
     logging.info('> gathering frame information')
     # calculate some frame specific
     # constants once in the beginning
-    temp_header, temp_data = read_funct(frames[0])
     # read the first frame
     # get image dimensions
     rows, cols = temp_data.shape
@@ -289,24 +367,25 @@ def main():
     logging.info(' - exposure : {:6.2f} s\n - scanwidth: {:6.2f} deg'.format(fexp, fwth))
     
     # find maxima
-    frame_data, local_max = find_peaks(frames, read_funct, _ARGS._QUEUE, _ARGS._MININT)
+    peak_data, local_max = find_peaks(frames, read_funct, _ARGS._QUEUE, _ARGS._MININT, _ARGS._MSIZE)
     if len(local_max) == 0:
         logging.info('ERROR: Not enough data!')
         raise SystemExit
     
     # filter peaklist
-    filtered = filter_peaks(local_max, _ARGS._QUEUE)
+    filtered = filter_peaks(local_max, _ARGS._QUEUE, _ARGS._MSIZE)
     if len(filtered) == 0:
         logging.info('ERROR: Not enough peaks!')
         raise SystemExit
     
     cryst_mosaic = []
-    with open(os.path.join(out_path, out_name), 'w') as wfile, PdfPages(os.path.join(out_path, '{}-fit.pdf'.format(stem))) as pdf:
-        wfile.write('Gauss;Sum;{};HKL;Frame;Profile\n'.format(';'.join(['Iraw_{:02}'.format(i) for i,v in enumerate(raw_data)])))
-        for (name, idx, px, py, peak) in filtered:
+    with open(os.path.join(out_path, out_name), 'w') as csv, PdfPages(os.path.join(out_path, '{}.pdf'.format(stem))) as pdf:
+        csv.write('Gauss;Sum;{};HKL;Frame;Profile\n'.format(';'.join(['Iraw_{:02}'.format(i) for i,v in enumerate(raw_data)])))
+        for (name, idx, px, py, ixy) in filtered:
             logging.info('\n| >>> Peak @ {:>4}x{:<4} on {}'.format(py, rows - px -1, os.path.basename(name)))
-            # procure data from list
-            f1 = frame_data[idx]
+            # procure data
+            f1 = peak_data[idx][(px,py)]
+            fnam = os.path.basename(frames[idx])
             # track peak profile
             # add intensities to list
             prof_list = []
@@ -314,34 +393,33 @@ def main():
                 if len(frames) <= i:
                     logging.info('ERROR: Please increase number of frames')
                     raise SystemExit
-                f2 = frame_data[i]
-                if _ARGS._USEMAT:
-                    ms = 1
-                    pInt = np.max(f2[px-ms:px+1+ms, py-ms:py+1+ms])
-                else:
-                    pInt = f2[px, py]
+                pInt = np.max(peak_data[i][(px,py)])
                 prof_list.append(pInt)
                 logging.info('|  Profile > {:7}'.format(pInt))
             # peak profile data
             prof_data = np.asarray(prof_list)
             
             # Mosaicity
-            I0 = np.sum(prof_data)
-            p0 = [I0, 0, 0.2]
+            p_cps = int(ixy*(1/fexp))
+            p_sum = np.sum(prof_data)
+            p0 = [p_sum, 0, 0.2]
             m_popt, m_pcov = curve_fit(f_gauss_ang, xgrid_f, prof_data, p0=p0)
             mosaic = float(m_popt[2])
             cryst_mosaic.append(mosaic)
             
+            if _ARGS._TIMEIT:
+                print('SKIPPING')
+                continue
+            
             # FIT PEAKS GAUSS/LORENTZ
             # initial guesses
             # sigma or gamma (gauss / lorentz)
-            I0 = np.sum(prof_data)
-            p0 = [I0, 0, 0.2]
             g_popt, g_pcov = curve_fit(I_gauss, xgrid_f, prof_data, p0=p0)
             g_err = np.sqrt(np.diag(g_pcov))
             g_max = g_popt[0]/((g_popt[2]/v)*np.sqrt(2*np.pi))
             logging.info('|\n| >>> Gaussian Fitted Peak')
-            logging.info('|  Integrated pixel intensity (sum) [phts]: {:.2e}'.format(I0))
+            logging.info('|  Estimated counts per second [cps]: {:.2e}'.format(p_cps))
+            logging.info('|  Integrated pixel intensity (sum) [phts]: {:.2e}'.format(p_sum))
             logging.info('|  Integrated pixel intensity (fit) [phts]: {:.2e}'.format(g_popt[0]))
             logging.info('|  Mosaicity (fit) [deg]: {:.2f}'.format(mosaic))
             logging.info('|  FWHM of count rate function [sec]: {:.2f}'.format(g_popt[2]*2.355))
@@ -354,7 +432,7 @@ def main():
                 t_popt, s_pcov = curve_fit(I_gauss, o_xgrid_f, o_prof_data, p0=p0)
                 t_err = np.sqrt(np.diag(s_pcov))
                 t_max = t_popt[0]/((t_popt[2]/v)*np.sqrt(2*np.pi))
-                logging.info('|\n| >>> Gaussian Shoulder Fit')
+                logging.info('|\n| >>> Gaussian Tail Fit')
                 logging.info('|  Integrated pixel intensity (fit) [phts]: {:.2e}'.format(t_popt[0]))
                 logging.info('|  FWHM of count rate function [sec]: {:.2f}'.format(t_popt[2]*2.355))
                 logging.info('|  Maximum count rate [phts/s]: {:.2e}'.format(t_max))
@@ -388,7 +466,6 @@ def main():
                 bruker_py = int(round((rows - px -1) / red_dim, 0))
                 bruker_px = int(round(py / red_dim, 0))
                 raw_int = []
-                fnam = os.path.basename(frames[idx])
                 for raw in raw_data:
                     _, rnum, fnum, _ = get_frame_info(fnam)
                     x = np.asarray([bruker_px, bruker_py, fnum]).astype(int)
@@ -414,10 +491,19 @@ def main():
                     continue
                 
                 logging.info('|  int: {} HKL: ({:3}{:3}{:3}) Frame: {}'.format(raw_int_s, h, k, l, fnam))
-                wfile.write('{};{};{};{:3}{:3}{:3};{};{}\n'.format(int(g_max), I0, raw_int_s, h, k, l, fnam, ';'.join(map(str, f_gauss(xgrid_s, *g_popt)))))
+                csv.write('{};{};{};{:3}{:3}{:3};{};{}\n'.format(int(g_max), p_sum, raw_int_s, h, k, l, fnam, ';'.join(map(str, f_gauss(xgrid_s, *g_popt)))))
             
             if _ARGS._PLOT:
                 fig, (p11,p12) = plt.subplots(1,2)
+                plt.subplots_adjust(left   = 0.1,  # the left side of the subplots of the figure
+                                    right  = 0.9,  # the right side of the subplots of the figure
+                                    bottom = 0.15, # the bottom of the subplots of the figure
+                                    top    = 0.85, # the top of the subplots of the figure
+                                    wspace = 0.2,  # the amount of width reserved for space between subplots,
+                                                   # expressed as a fraction of the average axis width
+                                    hspace = 0.2,  # the amount of height reserved for space between subplots,
+                                                   # expressed as a fraction of the average axis height
+                                    )
                 p11.set_title('[cnts]')
                 p12.set_title('[phts/s]')
                 p11.set_xlabel('Degree')
@@ -429,8 +515,8 @@ def main():
                 data = p11.plot(xgrid_f, prof_data, 'k*', label='Data')
                 gf = p11.plot(xgrid_f, I_gauss(xgrid_f, *g_popt), '-', color='#37a0cb', label='G: {:.2e}'.format(g_popt[0]))
                 gs = p12.plot(xgrid_s, f_gauss(xgrid_s, *g_popt), '-', color='#37a0cb', label='G: {:.2e}'.format(g_max))
-                fig.suptitle('Integrated pixel intensity (sum) [phts]: {:.2e}\nMosaicity (fit) [deg]: {:.2f}'.format(I0, mosaic))
-                plt.annotate('G:Gaussian fit, T:Gaussian fit tails only, L:Lorentzian fit', xy=(0.5, 0.02), xycoords='figure fraction', ha='center')
+                fig.suptitle('{}: {:>7} ctns @{:>4}x{:<4} ({} cps)\nIntegrated pixel intensity (sum) [phts]: {:.2e}, Mosaicity (fit) [deg]: {:.2f}'.format(fnam, ixy, px, py, p_cps, p_sum, mosaic), weight='bold')
+                plt.annotate('$\\bf{G}$:Gaussian fit, $\\bf{T}$:Gaussian fit tails only, $\\bf{L}$:Lorentzian fit', xy=(0.5, 0.03), xycoords='figure fraction', ha='center')
                 if _ARGS._RAW is not None:
                     plt.annotate('raw [ctns]: {}'.format(raw_int_s), xy=(0.5, 0.92), xycoords='figure fraction', ha='center')
                 if _ARGS._TAILS:
@@ -448,4 +534,7 @@ def main():
     logging.info('\nEst. mosaicity: {:.2f}° ({:.2f} - {:.2f})'.format(np.mean(cryst_mosaic), np.min(cryst_mosaic), np.max(cryst_mosaic)))
 
 if __name__ == '__main__':
+    import time
+    t0 = time.clock()
     main()
+    print('> {:.2f}s'.format(time.clock() - t0))
