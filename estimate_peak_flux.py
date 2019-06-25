@@ -16,7 +16,7 @@ def init_argparser():
     parser.add_argument('-o', required=False, default=None, metavar='path', type=str, dest='_OUTPATH', help='Specify the output path')
     parser.add_argument('-q', required=False, default=3,    metavar='int', type=int, dest='_QUEUE', help='Image queue, 2N+1 frames to monitor a profile, default: 3')
     parser.add_argument('-i', required=False, default=1e5,  metavar='int', type=int, dest='_MININT', help='Set the minimum peak intensity threshold for the peak search, default: 100000')
-    parser.add_argument('-m', required=False, default=1,    metavar='int', type=int, dest='_MSIZE', help='Track peaks by using the maximum value in a NxN matrix (with N = 2x+1) around the peak position')
+    parser.add_argument('-m', required=False, default=2,    metavar='int', type=int, dest='_MSIZE', help='Track peaks by using the maximum value in a NxN matrix (with N = 2x+1) around the peak position')
     #parser.add_argument('-m', required=False, action='store_true',  dest='_USEMAT', help='Track peaks by using the maximum value in a 3x3 matrix around the peak position instead of the exact coordinates')
     parser.add_argument('-t', required=False, action='store_true',  dest='_TAILS', help='Fit Gaussian to tails (additionally)')
     parser.add_argument('-l', required=False, action='store_true',  dest='_LORENTZ', help='Fit Lorentzian (additionally)')
@@ -98,7 +98,7 @@ def read_Pilatus(fname, dim1=981, dim2=1043, offset=4096, bytecode=np.int32):
     data = np.flipud(d)
     return header, data
     
-def find_peaks(frames, read_funct, queue, thresh, msize=1):
+def find_peaks(frames, read_funct, queue, thresh, msize):
     logging.info('\n >>> Hunting Peaks')
     # first iteration, find maxima and append to list
     # read the data, store relevant frame data in list
@@ -231,17 +231,17 @@ def filter_peaks(local_max, queue, msize):
                 filtered.pop()
                 reject.pop()
             else:
-                logging.info('-{}:{:7} @ {:>4}x{:<4}/{:3}'.format(bname, ixy, px, py, lm))
+                logging.info('-{}:{:7} @ {:>4}x{:<4} {:3}'.format(bname, ixy, px, py, lm))
                 continue
         else:
             lm = 1
         reject.append(lm)
         filtered.append(id)
         lx, ly, li = px, py, ixy
-        logging.info('{}{}:{:7} @ {:>4}x{:<4}/{:3}'.format(prefix, bname, ixy, px, py, lm))
+        logging.info('{}{}:{:7} @ {:>4}x{:<4} {:3}'.format(prefix, bname, ixy, px, py, lm))
     filtered = [n for i,n in enumerate(filtered) if reject[i] < queue]
     logging.info('\n >>> Filtered Peaklist: {}'.format(len(filtered)))
-    [logging.info('{}{:5}{:7} @ {:>4}x{:<4}'.format(bname, idx, ixy, px, py)) for (bname, idx, px, py, ixy) in filtered]
+    [logging.info('{}{:7} @ {:>4}x{:<4}'.format(bname, ixy, px, py)) for (bname, idx, px, py, ixy) in filtered]
     return filtered
 
 def get_frame_info(fnam):
@@ -515,7 +515,7 @@ def main():
                 data = p11.plot(xgrid_f, prof_data, 'k*', label='Data')
                 gf = p11.plot(xgrid_f, I_gauss(xgrid_f, *g_popt), '-', color='#37a0cb', label='G: {:.2e}'.format(g_popt[0]))
                 gs = p12.plot(xgrid_s, f_gauss(xgrid_s, *g_popt), '-', color='#37a0cb', label='G: {:.2e}'.format(g_max))
-                fig.suptitle('{}: {:>7} ctns @{:>4}x{:<4} ({} cps)\nIntegrated pixel intensity (sum) [phts]: {:.2e}, Mosaicity (fit) [deg]: {:.2f}'.format(fnam, ixy, px, py, p_cps, p_sum, mosaic), weight='bold')
+                fig.suptitle('{}: {:10,d} ctns @{:>4}x{:<4} ({:10,d} cps)\nIntegrated pixel intensity (sum): {:10,d} ctns, Mosaicity (fit) [deg]: {:.2f}'.format(fnam, ixy, px, py, p_cps, p_sum, mosaic), weight='bold')
                 plt.annotate('$\\bf{G}$:Gaussian fit, $\\bf{T}$:Gaussian fit tails only, $\\bf{L}$:Lorentzian fit', xy=(0.5, 0.03), xycoords='figure fraction', ha='center')
                 if _ARGS._RAW is not None:
                     plt.annotate('raw [ctns]: {}'.format(raw_int_s), xy=(0.5, 0.92), xycoords='figure fraction', ha='center')
